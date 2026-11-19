@@ -14,7 +14,6 @@ import (
 	"strings"
 	"syscall"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/mdp/qrterminal"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -69,28 +68,14 @@ func record(db *sql.DB, allowed chats, e *events.Message) error {
 	return err
 }
 
-func collect(ctx context.Context, dir string, allowed chats, pair bool) error {
-	if len(allowed) == 0 {
+func collect(ctx context.Context, dir string, allowed chats, pairOnly bool) error {
+	if !pairOnly && len(allowed) == 0 {
 		return errors.New("at least one --allow-chat is required")
 	}
-	if err := os.Mkdir(dir, 0o700); err != nil && !os.IsExist(err) {
-		return errors.New("cannot create private monitor directory")
+	if err := secureStore(dir); err != nil {
+		return err
 	}
-	info, err := os.Lstat(dir)
-	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 || info.Sys().(*syscall.Stat_t).Uid != uint32(os.Getuid()) {
-		return errors.New("monitor directory must be a real owner-only directory")
-	}
-	for _, name := range []string{"session.db", "messages.db"} {
-		path := filepath.Join(dir, name)
-		if st, err := os.Lstat(path); err == nil {
-			if !st.Mode().IsRegular() || st.Mode().Perm() != 0o600 || st.Sys().(*syscall.Stat_t).Uid != uint32(os.Getuid()) {
-				return errors.New("monitor databases must be real owner-only files")
-			}
-		} else if !os.IsNotExist(err) {
-			return errors.New("cannot inspect monitor database")
-		}
-	}
-	session, err := sqlstore.New(ctx, "sqlite3", filepath.Join(dir, "session.db")+"?_foreign_keys=on", nil)
+	session, err := sqlstore.New(ctx, sqliteDriver, sessionDSN(filepath.Join(dir, "session.db")), nil)
 	if err != nil {
 		return errors.New("cannot open protocol session store")
 	}
@@ -102,26 +87,32 @@ func collect(ctx context.Context, dir string, allowed chats, pair bool) error {
 	fresh := device.ID == nil
 	var terminal *os.File
 	if fresh {
-		if !pair {
-			return errors.New("not paired; explicit --pair from a private terminal is required")
+		if !pairOnly {
+			return errors.New("not paired; explicit --pair-only from a private terminal is required")
 		}
-		terminal, err = os.OpenFile("/dev/tty", os.O_WRONLY, 0)
+		terminal, err = privateConsole()
 		if err != nil {
 			return errors.New("pairing requires a private local terminal")
 		}
 		defer terminal.Close()
 	}
-	db, err := sql.Open("sqlite3", filepath.Join(dir, "messages.db")+"?_busy_timeout=2000")
-	if err != nil {
-		return errors.New("cannot open message store")
+	if pairOnly && !fresh {
+		return nil
 	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS messages (
+	var db *sql.DB
+	if !pairOnly {
+		db, err = sql.Open(sqliteDriver, messageDSN(filepath.Join(dir, "messages.db")))
+		if err != nil {
+			return errors.New("cannot open message store")
+		}
+		defer db.Close()
+		db.SetMaxOpenConns(1)
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS messages (
 		id TEXT NOT NULL, chat_jid TEXT NOT NULL, sender TEXT NOT NULL, content TEXT NOT NULL,
 		timestamp TEXT NOT NULL, is_from_me INTEGER NOT NULL, deleted_at TEXT,
 		PRIMARY KEY (chat_jid,id))`); err != nil {
-		return errors.New("cannot initialize message store")
+			return errors.New("cannot initialize message store")
+		}
 	}
 	client := whatsmeow.NewClient(device, nil)
 	client.ManualHistorySyncDownload = true
@@ -135,6 +126,9 @@ func collect(ctx context.Context, dir string, allowed chats, pair bool) error {
 	client.AddEventHandler(func(evt any) {
 		switch e := evt.(type) {
 		case *events.Message:
+			if db == nil {
+				return
+			}
 			if err := record(db, allowed, e); err != nil {
 				fmt.Fprintln(os.Stderr, "Message store write failed; stopping.")
 				stop()
@@ -143,6 +137,7 @@ func collect(ctx context.Context, dir string, allowed chats, pair bool) error {
 			stop()
 		}
 	})
+	paired := make(chan struct{}, 1)
 	if fresh {
 		qr, err := client.GetQRChannel(run)
 		if err != nil {
@@ -154,6 +149,7 @@ func collect(ctx context.Context, dir string, allowed chats, pair bool) error {
 				case "code":
 					qrterminal.GenerateHalfBlock(item.Code, qrterminal.L, terminal)
 				case "success":
+					paired <- struct{}{}
 					return
 				default:
 					stop()
@@ -166,15 +162,28 @@ func collect(ctx context.Context, dir string, allowed chats, pair bool) error {
 		return errors.New("WhatsApp protocol connection failed")
 	}
 	defer client.Disconnect()
+	if pairOnly {
+		select {
+		case <-paired:
+			return nil
+		case <-run.Done():
+			select {
+			case <-paired:
+				return nil
+			default:
+				return errors.New("pairing not confirmed")
+			}
+		}
+	}
 	<-run.Done()
 	return nil
 }
 
 func main() {
-	syscall.Umask(0o077)
+	privateDefaults()
 	allowed := chats{}
 	dir := flag.String("store", "", "new dedicated owner-only monitor directory (absolute path)")
-	pair := flag.Bool("pair", false, "allow initial QR pairing on the local controlling terminal")
+	pair := flag.Bool("pair-only", false, "pair in a private local console without opening a message database")
 	flag.Var(allowed, "allow-chat", "exact chat JID; repeat for additional chats")
 	flag.Parse()
 	if !filepath.IsAbs(*dir) || strings.ContainsAny(*dir, "?&#") {
